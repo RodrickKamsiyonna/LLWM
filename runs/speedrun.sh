@@ -72,7 +72,7 @@ torchrun --standalone --nproc_per_node=2 -m scripts.base_eval -- --device-batch-
 # SFT (teach the model conversation special tokens, tool use, multiple choice)
 
 # run SFT and eval the model
-torchrun --standalone --nproc_per_node=2 -m scripts.chat_sft -- --run=$WANDB_RUN
+#torchrun --standalone --nproc_per_node=2 -m scripts.chat_sft -- --run=$WANDB_RUN
 torchrun --standalone --nproc_per_node=2 -m scripts.chat_eval -- -i sft
 
 # chat with the model over CLI! Leave out the -p to chat interactively
