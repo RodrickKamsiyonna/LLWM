@@ -533,7 +533,7 @@ class GPT(nn.Module):
         lm_head = sum(p.numel() for p in self.predictor.head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         action_encoder = sum(p.numel() for p in self.action_encoder.parameters())
-        predictor = sum(p.numel() for p in self.predictor.parameters())
+        predictor = sum(p.numel() for block in self.predictor.blocks for p in block.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + action_encoder + predictor + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
@@ -557,12 +557,14 @@ class GPT(nn.Module):
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda] + predictor_ada_params
-        assert len(list(self.parameters())) == (
-            len(matrix_params) + len(embedding_params) + len(lm_head_params)
-            + len(value_embeds_params) + len(action_encoder_params)
-            + len(resid_params) + len(x0_params) + len(smear_params)
-        )
-    
+        assigned = set()
+        
+        for group in param_groups:
+            for p in group["params"]:
+                assigned.add(id(p))
+        
+        assert assigned == {id(p) for p in self.parameters()}
+            
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
     
