@@ -308,7 +308,6 @@ class GPT(nn.Module):
 
         # Embedding and unembedding
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=0.8)
-        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
 
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
         n_embd = self.config.n_embd
@@ -531,7 +530,7 @@ class GPT(nn.Module):
         """
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
-        lm_head = sum(p.numel() for p in self.lm_head.parameters())
+        lm_head = sum(p.numel() for p in self.predictor.head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         action_encoder = sum(p.numel() for p in self.action_encoder.parameters())
         predictor = sum(p.numel() for p in self.predictor.parameters())
@@ -553,7 +552,7 @@ class GPT(nn.Module):
         matrix_params = list(self.transformer.h.parameters()) + predictor_mlp_params
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
-        lm_head_params = list(self.lm_head.parameters()) + list(self.predictor.head.parameters())
+        lm_head_params = list(self.predictor.head.parameters())
         action_encoder_params = list(self.action_encoder.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
