@@ -557,14 +557,7 @@ class GPT(nn.Module):
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda] + predictor_ada_params
-        assigned = set()
-        
-        for group in param_groups:
-            for p in group["params"]:
-                assigned.add(id(p))
-        
-        assert assigned == {id(p) for p in self.parameters()}
-            
+    
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
     
@@ -581,8 +574,29 @@ class GPT(nn.Module):
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(
-                kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,))    
+                kind='muon',
+                params=group_params,
+                lr=matrix_lr,
+                momentum=0.95,
+                ns_steps=5,
+                beta2=0.9,
+                weight_decay=weight_decay,
+            ))
+    
+        assigned = set()
+        for group in param_groups:
+            for p in group["params"]:
+                if id(p) in assigned:
+                    raise RuntimeError(f"Duplicate parameter assigned to optimizer: {tuple(p.shape)}")
+                assigned.add(id(p))
+    
+        all_params = {id(p) for p in self.parameters()}
+        missing = all_params - assigned
+        extra = assigned - all_params
+    
+        assert not missing, f"{len(missing)} model parameters are missing from optimizer groups."
+        assert not extra, f"{len(extra)} optimizer parameters are not part of the model."
+    
         optimizer = MuonAdamW(param_groups)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
