@@ -236,15 +236,6 @@ def disable_fp8(model):
             setattr(parent, attr_name, fp8_module)
 
 
-class CEOnlyWrapper(nn.Module):
-    """Wraps the GPT model to return only CE loss as a scalar tensor.
-    Used for evaluate_bpb compatibility (expects model(x, y) -> scalar)."""
-    def __init__(self, model):
-        super().__init__()
-        self.wrapped = model
-
-    def forward(self, idx, targets, kv_cache=None):
-        return self.wrapped(idx, targets, kv_cache=kv_cache)["ce_loss"]
 
 # -----------------------------------------------------------------------------
 # Compile the model
@@ -410,7 +401,7 @@ while True:
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
         with disable_fp8(orig_model):
-            val_bpb = evaluate_bpb(CEOnlyWrapper(orig_model), val_loader, eval_steps, token_bytes)
+            val_bpb = evaluate_bpb(orig_model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
@@ -423,9 +414,6 @@ while True:
         model.train()
 
     # --- CORE metric (all ranks, uses uncompiled model) ---
-    # NOTE: if evaluate_core calls model(x, y) expecting a scalar, it will need
-    # a similar CEOnlyWrapper. It likely uses Engine.generate which calls encode(),
-    # so it may work as-is. Wrap if it breaks:
     results = {}
     if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
         model.eval()
