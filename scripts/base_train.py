@@ -202,7 +202,7 @@ def disable_fp8(model):
 
     fp8_locations = []
     for name, module in model.named_modules():
-        if 'Float8' in type(module).__name__":
+        if 'Float8' in type(module).__name__:
             if '.' in name:
                 parent_name, attr_name = name.rsplit('.', 1)
                 parent = model.get_submodule(parent_name)
