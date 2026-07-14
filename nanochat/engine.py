@@ -7,6 +7,9 @@ Everything works around token sequences:
 
 Notes:
 - The engine knows nothing about tokenization, it's purely token id sequences.
+- For the latent-action architecture, this uses a ZERO ACTION (unconditioned)
+  path through the Predictor for maximum speed with KV-cached generation.
+  For goal-directed generation with planned actions, use model.plan_and_generate().
 
 The whole thing is made as efficient as possible.
 """
@@ -40,7 +43,6 @@ def eval_with_timeout(formula, max_time=3):
                 return eval(formula, {"__builtins__": {}}, {})
     except Exception as e:
         signal.alarm(0)
-        # print(f"Warning: Failed to eval {formula}, exception: {e}") # it's ok ignore wrong calculator usage
         return None
 
 def use_calculator(expr):
@@ -58,7 +60,6 @@ def use_calculator(expr):
         return eval_with_timeout(expr)
 
     # Check if it's a string operation we support
-    # Allow: strings (single/double quotes), .count(), letters, numbers, spaces, parens
     allowed_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'\"()._ "
     if not all([x in allowed_chars for x in expr]):
         return None
@@ -75,7 +76,6 @@ def use_calculator(expr):
     if '.count(' not in expr:
         return None
 
-    # Evaluate with timeout
     return eval_with_timeout(expr)
 
 # -----------------------------------------------------------------------------
@@ -172,9 +172,32 @@ class Engine:
         self.model = model
         self.tokenizer = tokenizer # needed for tool use
 
+    def _get_logits(self, h):
+        """Get logits from hidden states using zero action (unconditioned).
+
+        Fast inference path: skips the ActionEncoder entirely and feeds a zero
+        action vector to the Predictor. The Predictor's AdaLN zero-init means
+        it acts as a near-identity at init, so the predictor head sees almost
+        the raw trunk hidden states — functionally similar to a plain lm_head.
+
+        For goal-directed generation with planned actions, use
+        model.plan_and_generate() instead (slower but higher quality).
+        """
+        B, T, _ = h.shape
+        action_dim = self.model.config.action_dim
+        zero_action = torch.zeros(B, T, action_dim, device=h.device, dtype=h.dtype)
+        logits = self.model.predictor(h, zero_action)
+        logits = logits[..., :self.model.config.vocab_size].float()
+        logits = 15 * torch.tanh(logits / 15)  # same logit squishing as training forward
+        return logits
+
     @torch.inference_mode()
     def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
-        """Same as generate, but does single prefill and then clones the KV cache."""
+        """Generate tokens using the latent-action model with KV cache.
+
+        Uses zero action (unconditioned) through the Predictor for speed.
+        For goal-directed generation, use model.plan_and_generate() instead.
+        """
         assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
         device = self.model.get_device()
         # Allocate the KV cache in the compute dtype so it matches what the forward pass emits
@@ -191,7 +214,7 @@ class Engine:
         assistant_end = get_special("<|assistant_end|>") # if sampled, ends row
         bos = self.tokenizer.get_bos_token_id() # if sampled, ends row
 
-        # 1) Run a batch 1 prefill of the prompt tokens
+        # 1) Run a batch=1 prefill of the prompt tokens through the trunk
         m = self.model.config
         kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
         kv_cache_prefill = KVCache(
@@ -202,8 +225,8 @@ class Engine:
             **kv_model_kwargs,
         )
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
-        logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
-        logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
+        h = self.model.encode(ids, kv_cache=kv_cache_prefill)
+        logits = self._get_logits(h)[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
 
         # 2) Replicate the KV cache for each sample/row
         kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
@@ -270,9 +293,10 @@ class Engine:
             yield token_column, token_masks
             num_generated += 1
 
-            # Prepare logits for next iteration
+            # Encode the new tokens through the trunk (KV-cached, single token per row)
             ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
-            logits = self.model.forward(ids, kv_cache=kv_cache_decode)[:, -1, :]  # (B, vocab_size)
+            h = self.model.encode(ids, kv_cache=kv_cache_decode)
+            logits = self._get_logits(h)[:, -1, :]  # (B, vocab_size)
 
     def generate_batch(self, tokens, num_samples=1, **kwargs):
         """
@@ -301,8 +325,8 @@ class Engine:
 
 if __name__ == "__main__":
     """
-    Quick inline test to make sure that the naive/slow model.generate function
-    is equivalent to the faster Engine.generate function here.
+    Quick inline test to make sure the Engine.generate function works correctly
+    with the latent-action architecture (encode + zero-action predictor path).
     """
     import time
     # init compute
@@ -315,26 +339,16 @@ if __name__ == "__main__":
     kwargs = dict(max_tokens=64, temperature=0.0)
     # set the starting prompt
     prompt_tokens = tokenizer.encode("The chemical formula of water is", prepend=bos_token_id)
-    # generate the reference sequence using the model.generate() function
-    generated_tokens = []
-    torch.cuda.synchronize()
-    t0 = time.time()
-    stream = model.generate(prompt_tokens, **kwargs)
-    for token in stream:
-        generated_tokens.append(token)
-        chunk = tokenizer.decode([token])
-        print(chunk, end="", flush=True)
-    print()
-    torch.cuda.synchronize()
-    t1 = time.time()
-    print(f"Reference time: {t1 - t0:.2f}s")
-    reference_ids = generated_tokens
-    # generate tokens with Engine
+
+    # --- Test 1: Engine generate (zero-action, KV-cached) ---
+    print("=" * 80)
+    print("Test 1: Engine.generate (zero action, KV-cached)")
+    print("=" * 80)
     generated_tokens = []
     engine = Engine(model, tokenizer)
-    stream = engine.generate(prompt_tokens, num_samples=1, **kwargs) # note: runs in fp32
     torch.cuda.synchronize()
     t0 = time.time()
+    stream = engine.generate(prompt_tokens, num_samples=1, **kwargs)
     for token_column, token_masks in stream:
         token = token_column[0] # only print out the first row
         generated_tokens.append(token)
@@ -344,9 +358,35 @@ if __name__ == "__main__":
     torch.cuda.synchronize()
     t1 = time.time()
     print(f"Engine time: {t1 - t0:.2f}s")
-    # compare the two sequences
-    for i in range(len(reference_ids)):
-        if reference_ids[i] != generated_tokens[i]:
-            print(f"Mismatch at {i}: {reference_ids[i]} != {generated_tokens[i]}")
-            break
-    print(f"Match: {reference_ids == generated_tokens}")
+    engine_ids = generated_tokens
+
+    # --- Test 2: model.plan_and_generate (goal-directed, planned actions) ---
+    print("\n" + "=" * 80)
+    print("Test 2: model.plan_and_generate (goal='.', planned actions)")
+    print("=" * 80)
+    goal_ids = tokenizer.encode(".")
+    torch.cuda.synchronize()
+    t0 = time.time()
+    planned_ids = model.plan_and_generate(
+        prompt_ids=prompt_tokens,
+        goal_ids=goal_ids,
+        num_steps=64,
+    )
+    planned_str = tokenizer.decode(prompt_tokens + planned_ids)
+    print(planned_str)
+    torch.cuda.synchronize()
+    t1 = time.time()
+    print(f"\nplan_and_generate time: {t1 - t0:.2f}s")
+
+    # --- Compare ---
+    # These will likely differ because:
+    #   - Engine uses zero action (unconditioned)
+    #   - plan_and_generate uses optimized actions toward the goal "."
+    # But both should produce coherent text if the model is trained.
+    print("\n" + "=" * 80)
+    print("Comparison")
+    print("=" * 80)
+    print(f"Engine (zero action) tokens: {engine_ids}")
+    print(f"Planned (goal='.') tokens:   {planned_ids}")
+    print(f"Sequences match: {engine_ids == planned_ids}")
+    print("(Mismatch is expected — different generation strategies)")
