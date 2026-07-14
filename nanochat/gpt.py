@@ -440,6 +440,10 @@ class GPT(nn.Module):
             attn_flops += 12 * h * q * effective_seq
         num_flops_per_token = 6 * self.num_matmul_params() + attn_flops
         return num_flops_per_token
+        
+    import torch._dynamo 
+    
+    @torch._dynamo.disable
     def equilibrium_matching_loss(self, h, action, targets, eqm_lambda=None):
         """Equilibrium Matching (EQM): trains the predictor's cross-entropy 'energy'
         landscape over actions to have a specific gradient field — pointing from a random
