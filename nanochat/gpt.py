@@ -686,7 +686,7 @@ class GPT(nn.Module):
     
         ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         kl_loss = -0.5 * torch.mean(1 + 2 * log_std - mean.pow(2) - std.pow(2))
-        eqm_loss = 0 #self.equilibrium_matching_loss(h, action, targets)    
+        eqm_loss = ce_loss.new_zeros(())  #self.equilibrium_matching_loss(h, action, targets)    
         return {
             "ce_loss": ce_loss,
             "kl_loss": kl_loss,
