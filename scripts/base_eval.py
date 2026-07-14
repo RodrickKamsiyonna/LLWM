@@ -34,7 +34,6 @@ from nanochat.checkpoint_manager import load_model
 from nanochat.core_eval import evaluate_task
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
 from nanochat.loss_eval import evaluate_bpb
-from nanochat.engine import Engine
 
 # -----------------------------------------------------------------------------
 # CORE evaluation
@@ -146,6 +145,7 @@ def main():
     # Distributed / precision setup
     device_type = autodetect_device_type() if args.device_type == '' else args.device_type
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+    
     # Load model and tokenizer
     model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=args.model_tag, step=args.step)
     sequence_len = meta["model_config"]["sequence_len"]
@@ -177,21 +177,33 @@ def main():
                 "My favorite color is",
                 "If 5*x + 3 = 13, then x is",
             ]
-            engine = Engine(model, tokenizer)
-            print0("\nConditioned samples:")
+            
+            # Goal token: full stop. The planner infers actions that steer
+            # the predictor from the prompt context toward a natural ending.
+            goal_ids = tokenizer.encode(".")
+
+            print0("\nConditioned samples (goal='.'):")
             for prompt in prompts:
-                tokens = tokenizer(prompt, prepend="<|bos|>")
-                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
-                sample_str = tokenizer.decode(sample[0])
+                prompt_tokens = tokenizer(prompt, prepend="<|bos|>")
+                gen_ids = model.plan_and_generate(
+                    prompt_ids=prompt_tokens,
+                    goal_ids=goal_ids,
+                    num_steps=16,
+                )
+                sample_str = tokenizer.decode(prompt_tokens + gen_ids)
                 print0("-" * 80)
                 print0(sample_str)
                 samples.append(sample_str)
 
-            print0("\nUnconditioned samples:")
-            tokens = tokenizer("", prepend="<|bos|>")
-            uncond, _ = engine.generate_batch(tokens, num_samples=8, max_tokens=128, temperature=1.0)
-            for sample in uncond:
-                sample_str = tokenizer.decode(sample)
+            print0("\nUnconditioned samples (goal='.'):")
+            bos_tokens = tokenizer("", prepend="<|bos|>")
+            for _ in range(8):
+                gen_ids = model.plan_and_generate(
+                    prompt_ids=bos_tokens,
+                    goal_ids=goal_ids,
+                    num_steps=128,
+                )
+                sample_str = tokenizer.decode(bos_tokens + gen_ids)
                 print0("-" * 80)
                 print0(sample_str)
                 unconditioned_samples.append(sample_str)
@@ -215,6 +227,10 @@ def main():
             print0(f"{split_name} bpb: {bpb:.6f}")
 
     # --- CORE evaluation ---
+    # NOTE: evaluate_task (called inside evaluate_core) likely uses Engine
+    # internally for generation. The Engine class will need to be updated
+    # to use model.plan_and_generate instead of model.lm_head for the
+    # latent-action architecture.
     if 'core' in eval_modes:
         print0("\n" + "="*80)
         print0("CORE Evaluation")
