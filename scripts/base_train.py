@@ -23,6 +23,7 @@ from contextlib import contextmanager
 
 import wandb
 import torch
+import torch.nn as nn
 import torch.distributed as dist
 
 from nanochat.gpt import GPT, GPTConfig, Linear
