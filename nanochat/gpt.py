@@ -30,14 +30,17 @@ class GPTConfig:
     sequence_len: int = 2048
     vocab_size: int = 32768
     n_layer: int = 12
-    n_head: int = 6 # number of query heads
-    n_kv_head: int = 6 # number of key/value heads (GQA)
+    n_head: int = 6
+    n_kv_head: int = 6
     n_embd: int = 768
-    # Sliding window attention pattern string, tiled across layers. Final layer always L.
-    # Characters: L=long (full context), S=short (quarter context)
-    # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    action_dim: int = None
+    action_encoder_depth_ratio: int = 2  # ActionEncoder gets ceil(n_layer / this); Predictor is fixed at ceil(n_layer/2)
+    eqm_lambda: float = 1.0
 
+    def __post_init__(self):
+        if self.action_dim is None:
+            self.action_dim = max(1, self.n_embd // 32)
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),)) # note that this will run in bf16, seems ok
@@ -63,7 +66,92 @@ def apply_rotary_emb(x, cos, sin):
     y1 = x1 * cos + x2 * sin # rotate pairs of dims
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
+class AdaLN(nn.Module):
+    """DiT-style adaptive-norm modulation: projects the latent action into per-channel
+    (shift, scale, gate). Zero-init so at init gate=0 -> conditioned branch is a no-op
+    residual; training gradually turns on the action's influence. This is what "condition
+    with layer norm" means once norm() has no learnable affine params of its own."""
+    def __init__(self, action_dim, n_embd):
+        super().__init__()
+        self.proj = Linear(action_dim, 3 * n_embd, bias=False)
 
+    def forward(self, action):
+        shift, scale, gate = self.proj(action).chunk(3, dim=-1)
+        return shift, scale, gate
+
+
+class MLPBlock(nn.Module):
+    """Pre-norm residual MLP, same relu^2 / no-bias pattern as the trunk's MLP, at a
+    configurable width. Used by the ActionEncoder."""
+    def __init__(self, dim, expansion=4):
+        super().__init__()
+        self.c_fc = Linear(dim, expansion * dim, bias=False)
+        self.c_proj = Linear(expansion * dim, dim, bias=False)
+
+    def forward(self, x):
+        h = F.relu(self.c_fc(norm(x))).square()
+        return x + self.c_proj(h)
+
+
+class ActionEncoder(nn.Module):
+    """Infers a ~ N(mean, std) explaining the transition h_t -> y_t. Scaled relative to
+    the trunk on both axes: half the width (n_embd // 2) and a fraction of the depth
+    (ceil(n_layer / action_encoder_depth_ratio), default quarter-depth) — it only needs
+    to compress down to action_dim (n_embd // 32), not model vocab-scale distributions,
+    so it tracks the trunk's size without needing to match it."""
+    def __init__(self, config):
+        super().__init__()
+        hidden = config.n_embd // 2
+        depth = max(1, -(-config.n_layer // config.action_encoder_depth_ratio))  # ceil division
+        self.in_proj = Linear(2 * config.n_embd, hidden, bias=False)
+        self.blocks = nn.ModuleList([MLPBlock(hidden) for _ in range(depth)])
+        self.mean_head = Linear(hidden, config.action_dim, bias=False)
+        self.log_std_head = Linear(hidden, config.action_dim, bias=False)
+
+    def forward(self, h, y_emb):
+        x = self.in_proj(torch.cat([h.detach(), y_emb.detach()], dim=-1))
+        for block in self.blocks:
+            x = block(x)
+        x = norm(x)
+        mean = self.mean_head(x)
+        log_std = torch.clamp(self.log_std_head(x), min=-5.0, max=2.0)
+        return mean, log_std
+
+class PredictorBlock(nn.Module):
+    """Pre-norm relu^2 MLP (reuses the trunk's MLP class as-is), modulated by the action
+    via AdaLN. Purely pointwise — h_t already carries full causal context from the trunk's
+    attention, so no attention is needed here, just a nonlinear combination of
+    (context, action) at each position."""
+    def __init__(self, config):
+        super().__init__()
+        self.mlp = MLP(config)
+        self.ada = AdaLN(config.action_dim, config.n_embd)
+
+    def forward(self, x, action):
+        shift, scale, gate = self.ada(action)
+        h = norm(x) * (1 + scale) + shift
+        x = x + gate * self.mlp(h)
+        return x
+
+
+class Predictor(nn.Module):
+    """Stack of AdaLN-MLP blocks operating pointwise on (h_t, action_t). Depth =
+    ceil(n_layer / 2): it only resolves 'what does this action mean here', not
+    re-derive context, so it needs less depth than the trunk. Width = n_embd,
+    matching the encoder exactly."""
+    def __init__(self, config, pad_vocab_size_to=64):
+        super().__init__()
+        self.n_layer = -(-config.n_layer // 2)  # ceil(n_layer / 2)
+        self.blocks = nn.ModuleList([PredictorBlock(config) for _ in range(self.n_layer)])
+        padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
+        self.head = Linear(config.n_embd, padded_vocab_size, bias=False)
+
+    def forward(self, h, action):
+        x = h
+        for block in self.blocks:
+            x = block(x, action)
+        return self.head(norm(x))
+        
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -174,7 +262,8 @@ class GPT(nn.Module):
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
-        self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
+        self.action_encoder = ActionEncoder(config)
+        self.predictor = Predictor(config, pad_vocab_size_to=pad_vocab_size_to)
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
         # x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled)
@@ -194,6 +283,7 @@ class GPT(nn.Module):
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
         # In the future we can dynamically grow the cache, for now it's fine.
+
         self.rotary_seq_len = config.sequence_len * 10 # 10X over-compute should be enough, TODO make nicer?
         head_dim = config.n_embd // config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
@@ -231,6 +321,20 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
+        a_in = self.action_encoder.in_proj.weight.shape[1]
+        torch.nn.init.uniform_(self.action_encoder.in_proj.weight, -a_in**-0.5, a_in**-0.5)
+        for block in self.action_encoder.blocks:
+            fan_in = block.c_fc.weight.shape[1]
+            torch.nn.init.uniform_(block.c_fc.weight, -fan_in**-0.5, fan_in**-0.5)
+            torch.nn.init.zeros_(block.c_proj.weight)
+        torch.nn.init.zeros_(self.action_encoder.mean_head.weight)
+        torch.nn.init.zeros_(self.action_encoder.log_std_head.weight)
+        
+        for block in self.predictor.blocks:
+            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)
+            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            torch.nn.init.zeros_(block.ada.proj.weight)
+        torch.nn.init.normal_(self.predictor.head.weight, mean=0.0, std=0.001)
         # Per-layer scalars
         # Per-layer resid init: stronger residual at early layers, weaker at deep layers
         n_layer = self.config.n_layer
@@ -337,7 +441,33 @@ class GPT(nn.Module):
             attn_flops += 12 * h * q * effective_seq
         num_flops_per_token = 6 * self.num_matmul_params() + attn_flops
         return num_flops_per_token
-
+    def equilibrium_matching_loss(self, h, action, targets, eqm_lambda=None):
+        """Equilibrium Matching (EQM): trains the predictor's cross-entropy 'energy'
+        landscape over actions to have a specific gradient field — pointing from a random
+        noise action `eps` back toward the actual sampled `action`, scaled by how far along
+        the noise->action interpolation gamma we are. This is what makes gradient descent
+        over actions at planning time (plan_and_generate) actually work: without it, nothing
+        guarantees the predictor's loss surface w.r.t. action has a useful slope away from
+        the training point, only exactly at it."""
+        if eqm_lambda is None:
+            eqm_lambda = self.config.eqm_lambda
+        B, T, _ = action.shape
+        gamma = torch.rand(B, T, 1, device=action.device, dtype=action.dtype)
+        eps = torch.randn_like(action)
+        act_gamma = (gamma * action.detach() + (1 - gamma) * eps).requires_grad_(True)
+    
+        logits_noisy = self.predictor(h.detach(), act_gamma)
+        logits_noisy = logits_noisy[..., :self.config.vocab_size].float()
+        energy = F.cross_entropy(
+            logits_noisy.reshape(-1, self.config.vocab_size), targets.reshape(-1),
+            ignore_index=-1, reduction='sum',
+        )
+    
+        # create_graph=True: this gradient itself must stay differentiable so loss_eqm's
+        # backward() can update the predictor's parameters, not just act_gamma.
+        grad_energy = torch.autograd.grad(energy, act_gamma, create_graph=True)[0]
+        target_grad = (eps - action.detach()) * eqm_lambda * (1 - gamma)
+        return (grad_energy - target_grad).pow(2).mean()
     def num_matmul_params(self):
         """
         The number of parameters that participate in matmuls with the token stream,
@@ -399,102 +529,96 @@ class GPT(nn.Module):
         Returns a dict with counts for each parameter group, so downstream analysis
         can experiment with which combination gives the cleanest scaling laws.
         """
-        # Count each group separately (mirrors the grouping in setup_optimizers)
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
+        action_encoder = sum(p.numel() for p in self.action_encoder.parameters())
+        predictor = sum(p.numel() for p in self.predictor.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        total = wte + value_embeds + lm_head + transformer_matrices + action_encoder + predictor + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
-            'wte': wte,
-            'value_embeds': value_embeds,
-            'lm_head': lm_head,
+            'wte': wte, 'value_embeds': value_embeds, 'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
-            'scalars': scalars,
-            'total': total,
+            'action_encoder': action_encoder, 'predictor': predictor,
+            'scalars': scalars, 'total': total,
         }
-
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
         model_dim = self.config.n_embd
-
-        # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+    
+        predictor_mlp_params = [p for block in self.predictor.blocks for p in block.mlp.parameters()]
+        predictor_ada_params = [p for block in self.predictor.blocks for p in block.ada.parameters()]
+    
+        matrix_params = list(self.transformer.h.parameters()) + predictor_mlp_params
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
-        lm_head_params = list(self.lm_head.parameters())
+        lm_head_params = list(self.lm_head.parameters()) + list(self.predictor.head.parameters())
+        action_encoder_params = list(self.action_encoder.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
-
-        # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
+        smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda] + predictor_ada_params
+        assert len(list(self.parameters())) == (
+            len(matrix_params) + len(embedding_params) + len(lm_head_params)
+            + len(value_embeds_params) + len(action_encoder_params)
+            + len(resid_params) + len(x0_params) + len(smear_params)
+        )
+    
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
-
-        # Build param_groups with all required fields explicit
+    
         param_groups = [
-            # AdamW groups (embeddings, lm_head, scalars)
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
+            dict(kind='adamw', params=action_encoder_params, lr=matrix_lr * dmodel_lr_scale, betas=(0.8, 0.95), eps=1e-10, weight_decay=weight_decay),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
-            dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
+            dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        # Muon groups (matrix params, grouped by shape for stacking)
+    
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(
                 kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
-            ))
-
+                momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,))    
         optimizer = MuonAdamW(param_groups)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
         return optimizer
-
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    
+    def encode(self, idx, kv_cache=None):
+        """Trunk forward, logic unchanged from before — just returns h (post-final-norm)
+        instead of going straight to lm_head, so both the plain LM path and the
+        world-model path (action_encoder/predictor) can consume it."""
         B, T = idx.size()
-
-        # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
-        assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
-        assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
-        # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
+        assert idx.device == self.cos.device
+        assert self.cos.dtype == COMPUTE_DTYPE
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
-        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
-
-        # Embed the tokens
-        x = self.transformer.wte(idx) # embed current token
-        x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
+        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
+    
+        x = self.transformer.wte(idx)
+        x = x.to(COMPUTE_DTYPE)
         x = norm(x)
-
-        # Smear: mix previous token's embedding into current position (cheap bigram info)
+    
         if kv_cache is None:
-            # Training / naive generate: full sequence available, use fast slice
             assert T > 1, "Training forward pass should have T > 1"
             gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
             x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
         else:
-            # KV cache inference: read prev embedding from cache, store current for next step
             x_pre_smear = kv_cache.prev_embedding
             kv_cache.prev_embedding = x[:, -1:, :]
             if T > 1:
-                # Prefill: apply smear to positions 1+, same as training
                 gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
                 x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
             elif x_pre_smear is not None:
-                # Decode: single token, use cached prev embedding
                 gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
                 x = x + gate * x_pre_smear
-
-        # Forward the trunk of the Transformer
-        x0 = x  # save initial normalized embedding for x0 residual
+    
+        x0 = x
         n_layer = self.config.n_layer
-        backout_layer = n_layer // 2  # cache at halfway point
+        backout_layer = n_layer // 2
         x_backout = None
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
@@ -502,54 +626,109 @@ class GPT(nn.Module):
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             if i == backout_layer:
                 x_backout = x
-        # Subtract mid-layer residual to remove low-level features before logit projection
         if x_backout is not None:
             x = x - self.backout_lambda.to(x.dtype) * x_backout
-        x = norm(x)
-
-        # Forward the lm_head (compute logits)
-        softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
-        logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
-        logits = logits[..., :self.config.vocab_size] # slice to remove padding
-        logits = logits.float() # switch to fp32 for logit softcap and loss computation
-        logits = softcap * torch.tanh(logits / softcap) # squash the logits
-
-        if targets is not None:
-            # training: given the targets, compute and return the loss
-            # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-            return loss
-        else:
-            # inference: just return the logits directly
-            return logits
-
-    @torch.inference_mode()
-    def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
-        """
-        Naive autoregressive streaming inference.
-        To make it super simple, let's assume:
-        - batch size is 1
-        - ids and the yielded tokens are simple Python lists and ints
-        """
-        assert isinstance(tokens, list)
+        return norm(x)
+    
+    def encode_embeddings(self, emb, kv_cache=None):
+        """Same trunk as encode(), but input is already-embedded (used during planning,
+        where 'thinking' tokens are soft/probability-weighted rather than hard ids).
+        ve is omitted since it needs a hard token id we don't have here."""
+        B, T, _ = emb.shape
+        T0 = 0 if kv_cache is None else kv_cache.get_pos()
+        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
+        x = norm(emb.to(COMPUTE_DTYPE))
+        if T > 1:
+            gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
+            x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
+        x0 = x
+        x_backout = None
+        for i, block in enumerate(self.transformer.h):
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            x = block(x, None, cos_sin, self.window_sizes[i], kv_cache)
+            if i == self.config.n_layer // 2:
+                x_backout = x
+        x = x - self.backout_lambda.to(x.dtype) * x_backout
+        return norm(x)
+        
+    def forward(self, idx, targets, kv_cache=None):
+        """Latent-action objective: infer action from (h, target) via ActionEncoder,
+        predict target from (h, action) via the AdaLN-conditioned Predictor.
+        Returns CE + KL, same convention as a VAE-style latent bottleneck."""
+        h = self.encode(idx, kv_cache=kv_cache)
+        y_emb = self.transformer.wte(targets.clamp(min=0)).to(h.dtype)  # clamp guards ignore_index=-1
+        mean, log_std = self.action_encoder(h, y_emb)
+        std = log_std.exp()
+        action = mean + std * torch.randn_like(mean)
+    
+        logits = self.predictor(h, action)
+        logits = logits[..., :self.config.vocab_size].float()
+        logits = 15 * torch.tanh(logits / 15)
+    
+        ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        kl_loss = -0.5 * torch.mean(1 + 2 * log_std - mean.pow(2) - std.pow(2))
+        eqm_loss = self.equilibrium_matching_loss(h, action, targets)    
+        return {
+            "ce_loss": ce_loss,
+            "kl_loss": kl_loss,
+            "eqm_loss": eqm_loss}
+        
+    def _new_kv_cache(self, batch_size=1):
+        """Trunk-only cache — the Predictor has no attention layers, so it needs no cache."""
+        from nanochat.engine import KVCache
+        head_dim = self.config.n_embd // self.config.n_head
+        return KVCache(
+            batch_size=batch_size, num_layers=self.config.n_layer,
+            num_kv_heads=self.config.n_kv_head, head_dim=head_dim,
+            max_seq_len=self.config.sequence_len, device=self.get_device(), dtype=COMPUTE_DTYPE,
+        )
+    @torch.enable_grad()
+    def plan_and_generate(self, prompt_ids, goal_ids, num_steps, lr=0.05, num_iters=150):
+        """Optimize `num_steps` latent thinking-actions so the model's own
+        ActionEncoder/Predictor can explain the known goal continuation, then decode
+        tokens using the planned actions. Full-recompute version (no kv_cache) for
+        correctness/clarity — see note below for a kv-cache-accelerated version."""
+        self.eval()
         device = self.get_device()
-        rng = None
-        if temperature > 0:
-            rng = torch.Generator(device=device)
-            rng.manual_seed(seed)
-        ids = torch.tensor([tokens], dtype=torch.long, device=device) # add batch dim
-        for _ in range(max_tokens):
-            logits = self.forward(ids) # (B, T, vocab_size)
-            logits = logits[:, -1, :] # (B, vocab_size)
-            if top_k is not None and top_k > 0:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            if temperature > 0:
-                logits = logits / temperature
-                probs = F.softmax(logits, dim=-1)
-                next_ids = torch.multinomial(probs, num_samples=1, generator=rng)
-            else:
-                next_ids = torch.argmax(logits, dim=-1, keepdim=True)
-            ids = torch.cat((ids, next_ids), dim=1)
-            token = next_ids.item()
-            yield token
+        prompt = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+        goal = torch.tensor([goal_ids], dtype=torch.long, device=device)
+        actions = torch.randn(1, num_steps, self.config.action_dim, device=device, requires_grad=True)
+        planner = torch.optim.Adam([actions], lr=lr)
+    
+        def compute_goal_loss(act):
+            emb = self.transformer.wte(prompt).to(COMPUTE_DTYPE)
+            for step in range(num_steps):
+                h_last = self.encode_embeddings(emb)[:, -1:, :]
+                logits = self.predictor(h_last, act[:, step:step+1, :])
+                probs = F.softmax(logits[..., :self.config.vocab_size].float(), dim=-1).to(COMPUTE_DTYPE)
+                soft_emb = probs @ self.transformer.wte.weight[:self.config.vocab_size]
+                emb = torch.cat([emb, soft_emb], dim=1)
+    
+            goal_emb = self.transformer.wte(goal).to(COMPUTE_DTYPE)
+            losses = []
+            for j in range(goal.shape[1]):
+                h_last = self.encode_embeddings(emb)[:, -1:, :]
+                mean, _ = self.action_encoder(h_last, goal_emb[:, j:j+1, :])  # deterministic goal action
+                logits = self.predictor(h_last, mean)
+                losses.append(F.cross_entropy(logits[:, -1, :self.config.vocab_size].float(), goal[:, j]))
+                emb = torch.cat([emb, goal_emb[:, j:j+1, :]], dim=1)  # teacher force
+            return torch.stack(losses).mean()
+    
+        for _ in range(num_iters):
+            planner.zero_grad()
+            compute_goal_loss(actions).backward()
+            planner.step()
+        
+        with torch.no_grad():
+            kv_cache = self._new_kv_cache(batch_size=1)
+            prompt_emb = self.transformer.wte(prompt).to(COMPUTE_DTYPE)
+            h_last = self.encode_embeddings(prompt_emb, kv_cache=kv_cache)[:, -1:, :]  # prefill
+        
+            gen_ids = []
+            for step in range(num_steps):
+                logits = self.predictor(h_last, actions[:, step:step+1, :])
+                tok = logits[..., :self.config.vocab_size].argmax(dim=-1)
+                gen_ids.append(tok.item())
+                new_emb = self.transformer.wte(tok).to(COMPUTE_DTYPE)               # only the newest token
+                h_last = self.encode_embeddings(new_emb, kv_cache=kv_cache)[:, -1:, :]
+        return gen_ids
