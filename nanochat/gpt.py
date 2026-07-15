@@ -332,7 +332,7 @@ class GPT(nn.Module):
         for block in self.predictor.blocks:
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
-            torch.nn.init.zeros_(block.ada.proj.weight)
+            torch.nn.init.normal_(block.ada.proj.weight)
         torch.nn.init.normal_(self.predictor.head.weight, mean=0.0, std=0.001)
         # Per-layer scalars
         # Per-layer resid init: stronger residual at early layers, weaker at deep layers
