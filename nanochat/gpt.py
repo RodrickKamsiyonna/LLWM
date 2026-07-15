@@ -326,8 +326,8 @@ class GPT(nn.Module):
             fan_in = block.c_fc.weight.shape[1]
             torch.nn.init.uniform_(block.c_fc.weight, -fan_in**-0.5, fan_in**-0.5)
             torch.nn.init.zeros_(block.c_proj.weight)
-        torch.nn.init.zeros_(self.action_encoder.mean_head.weight)
-        torch.nn.init.zeros_(self.action_encoder.log_std_head.weight)
+        torch.nn.init.normal_(self.action_encoder.mean_head.weight)
+        torch.nn.init.normal_(self.action_encoder.log_std_head.weight)
         
         for block in self.predictor.blocks:
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)
