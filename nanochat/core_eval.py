@@ -140,7 +140,6 @@ def batch_sequences_lm(tokenizer, prompts):
     # we only need the with continuation prompt in the LM task, i.e. batch size of 1
     return [tokens_with], [start_idx], [end_idx]
 
-
 @torch.no_grad()
 def forward_model(model, input_ids):
     """
@@ -148,21 +147,27 @@ def forward_model(model, input_ids):
     The last column of losses is set to nan because we don't have autoregressive targets there.
     """
     batch_size, seq_len = input_ids.size()
-    outputs = model(input_ids)
-    # Roll the tensor to the left by one position to get the (autoregressive) target ids
     target_ids = torch.roll(input_ids, shifts=-1, dims=1)
-    # Calculate cross entropy at all positions
+
+    # Replicate GPT.forward's computation, but keep per-token logits instead of
+    # collapsing to a scalar ce_loss. Uses the action *mean* (no sampling noise)
+    # so eval is deterministic, since we don't need the KL/EQM training signal here.
+    h = model.encode(input_ids)
+    y_emb = model.transformer.wte(target_ids.clamp(min=0)).to(h.dtype)
+    mean, _ = model.action_encoder(h, y_emb)
+    logits = model.predictor(h, mean)
+    logits = logits[..., :model.config.vocab_size].float()
+    outputs = 15 * torch.tanh(logits / 15)
+
     losses = torch.nn.functional.cross_entropy(
         outputs.view(batch_size * seq_len, -1),
         target_ids.view(batch_size * seq_len),
         reduction='none'
     ).view(batch_size, seq_len)
-    # Set the last column to be nan because there is no autoregressive loss there
     losses[:, -1] = float('nan')
-    # Get the argmax predictions at each position
     predictions = outputs.argmax(dim=-1)
     return losses, predictions
-
+    
 
 @torch.no_grad()
 def evaluate_example(idx, model, tokenizer, data, device, task_meta):
