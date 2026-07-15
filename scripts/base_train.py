@@ -57,7 +57,7 @@ parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding 
 parser.add_argument("--kl-lambda", type=float, default=1e-3, help="weight for KL divergence loss (action encoder regularization)")
 parser.add_argument("--eqm-lambda", type=float, default=1.0, help="weight for equilibrium matching loss (passed into GPT model)")
 # Training horizon (only one used, in order of precedence)
-parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
+parser.add_argument("--num-iterations", type=int, default=10000, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
 parser.add_argument("--target-param-data-ratio", type=float, default=12, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
 # Optimization
