@@ -40,7 +40,7 @@ class GPTConfig:
 
     def __post_init__(self):
         if self.action_dim is None:
-            self.action_dim = max(1, self.n_embd)
+            self.action_dim = max(1, self.n_embd//32)
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),)) # note that this will run in bf16, seems ok
