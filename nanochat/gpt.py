@@ -737,17 +737,15 @@ class GPT(nn.Module):
             planner.zero_grad()
             compute_goal_loss(actions).backward()
             planner.step()
-        
         with torch.no_grad():
-            kv_cache = self._new_kv_cache(batch_size=1)
-            prompt_emb = self.transformer.wte(prompt).to(COMPUTE_DTYPE)
-            h_last = self.encode_embeddings(prompt_emb, kv_cache=kv_cache)[:, -1:, :]  # prefill
-        
+            emb = self.transformer.wte(prompt).to(COMPUTE_DTYPE)
+
             gen_ids = []
             for step in range(num_steps):
+                h_last = self.encode_embeddings(emb)[:, -1:, :]
                 logits = self.predictor(h_last, actions[:, step:step+1, :])
                 tok = logits[..., :self.config.vocab_size].argmax(dim=-1)
                 gen_ids.append(tok.item())
-                new_emb = self.transformer.wte(tok).to(COMPUTE_DTYPE)               # only the newest token
-                h_last = self.encode_embeddings(new_emb, kv_cache=kv_cache)[:, -1:, :]
+                new_emb = self.transformer.wte(tok).to(COMPUTE_DTYPE)
+                emb = torch.cat([emb, new_emb], dim=1)
         return gen_ids
