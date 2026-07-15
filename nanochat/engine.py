@@ -81,7 +81,6 @@ class Engine:
         self.model = model
         self.tokenizer = tokenizer
 
-    @torch.inference_mode()
     def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42, goal_ids=None):
         """Generate tokens using model.plan_and_generate.
 
