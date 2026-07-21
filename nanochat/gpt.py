@@ -337,10 +337,24 @@ class GPT(nn.Module):
 
     def num_scaling_params(self):
         """
-        Return detailed parameter counts for scaling law analysis. Unlike the old
-        hand-rolled trunk, the backbone here contributes zero trainable parameters -
-        it's reported separately (`backbone_frozen`) so scaling-law fits over the
-        trainable head can exclude it if desired.
+        Return detailed parameter counts for scaling law analysis.
+
+        IMPORTANT: this keeps the OLD key names ('wte', 'value_embeds',
+        'transformer_matrices', 'lm_head', 'action_encoder', 'predictor', 'scalars',
+        'total') alive too, purely so call sites like base_train.py's
+        `params_counts['transformer_matrices'] + params_counts['lm_head']` don't
+        KeyError. 'transformer_matrices' is mapped to the frozen backbone's param count
+        (closest old-key analogue - it used to be "the trunk's big matrix stack", which
+        is now Qwen1.5 instead of our own attention/MLP blocks). 'wte', 'value_embeds',
+        and 'scalars' are 0 - there's no separate trainable embedding table or per-layer
+        scalar params anymore, they're gone along with the old trunk.
+
+        CAVEAT for anything doing Chinchilla-style compute-optimal scaling-law math with
+        these numbers: 'transformer_matrices' (the backbone) is FROZEN - it costs forward
+        FLOPs but receives no gradient and isn't "trained" in the way the old trunk was.
+        If your scaling-law code assumes `transformer_matrices + lm_head` params are all
+        being trained, that assumption no longer holds; you likely want 'trainable_total'
+        (action_encoder + predictor + lm_head only) for that kind of analysis instead.
         """
         backbone = self.num_backbone_params()
         lm_head = sum(p.numel() for p in self.predictor.head.parameters())
@@ -351,9 +365,13 @@ class GPT(nn.Module):
         if self.backbone is not None:
             assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
-            'backbone_frozen': backbone, 'lm_head': lm_head,
-            'action_encoder': action_encoder, 'predictor': predictor,
-            'trainable_total': trainable_total, 'total': total,
+            # new, clearer names
+            'backbone_frozen': backbone, 'trainable_total': trainable_total,
+            # old names, kept alive for backward compatibility (see docstring caveat above)
+            'wte': 0, 'value_embeds': 0, 'scalars': 0,
+            'transformer_matrices': backbone,
+            'lm_head': lm_head, 'action_encoder': action_encoder, 'predictor': predictor,
+            'total': total,
         }
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
