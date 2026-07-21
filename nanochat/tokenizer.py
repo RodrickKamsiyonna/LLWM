@@ -21,8 +21,10 @@ import os
 import re
 import json
 import copy
+import pickle
 from functools import lru_cache
 
+import tiktoken
 from transformers import AutoTokenizer, AutoConfig
 from transformers.models.gpt2.tokenization_gpt2 import bytes_to_unicode
 
@@ -186,8 +188,17 @@ class RustBPETokenizer:
 
     @classmethod
     def from_directory(cls, tokenizer_dir):
-        hf_tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
         meta_path = os.path.join(tokenizer_dir, "nanochat_special_map.json")
+        pickle_path = os.path.join(tokenizer_dir, "tokenizer.pkl")
+        if os.path.exists(pickle_path) and not os.path.exists(meta_path):
+            # Legacy directory saved by the old pickle-based save() (e.g. a
+            # from_pretrained() tiktoken baseline that got saved for some reason).
+            with open(pickle_path, "rb") as f:
+                enc = pickle.load(f)
+            return cls(enc, "<|bos|>" if "<|bos|>" in getattr(enc, "special_tokens_set", set()) else "<|endoftext|>")
+
+        # Normal case: an HF-tokenizer directory (the Qwen1.5-backed nanochat tokenizer).
+        hf_tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
         if os.path.exists(meta_path):
             with open(meta_path) as f:
                 special_map = json.load(f)
@@ -210,15 +221,17 @@ class RustBPETokenizer:
         return cls(enc, "<|bos|>")
 
     @classmethod
-    def from_pretrained(cls, hf_model_name=None):
-        """Previously loaded a *tiktoken* public encoding by name (e.g. 'cl100k_base').
-        Now loads an HF tokenizer by model name instead (defaults to the same Qwen1.5
-        checkpoint nanochat.gpt.GPTConfig uses) - functionally identical to
-        from_qwen(). NOTE: if some other script calls this with an old tiktoken
-        encoding name expecting the old GPT-4-style public vocab specifically, that
-        will now fail (there's no HF model by that name) - update that call site to
-        pass a real HF/Qwen model name, or just call from_qwen()."""
-        return cls.from_qwen(hf_model_name)
+    def from_pretrained(cls, tiktoken_name):
+        """Unchanged from before: loads a real tiktoken PUBLIC encoding by name (e.g.
+        'gpt2', 'cl100k_base'). This has nothing to do with the Qwen1.5 backbone - it's
+        used by benchmarking/eval scripts (like tok_eval.py) purely to compare
+        nanochat's tokenizer's compression ratio against GPT-2's/GPT-4's. For the actual
+        model-facing tokenizer (the one gpt.py's frozen backbone indexes into), use
+        from_qwen() or get_tokenizer() instead - don't conflate the two."""
+        # https://github.com/openai/tiktoken/blob/eedc8563/tiktoken_ext/openai_public.py
+        enc = tiktoken.get_encoding(tiktoken_name)
+        # tiktoken calls the special document delimiter token "<|endoftext|>"
+        return cls(enc, "<|endoftext|>")
 
     def get_vocab_size(self):
         return self.enc.n_vocab
@@ -273,13 +286,21 @@ class RustBPETokenizer:
         return self.enc.decode_single_token_bytes(token_id)
 
     def save(self, tokenizer_dir):
-        # save the HF tokenizer + nanochat's special-token id map to disk
         os.makedirs(tokenizer_dir, exist_ok=True)
-        self.enc.hf_tokenizer.save_pretrained(tokenizer_dir)
-        meta_path = os.path.join(tokenizer_dir, "nanochat_special_map.json")
-        with open(meta_path, "w") as f:
-            json.dump(self.enc.special_map, f)
-        print(f"Saved Qwen1.5 tokenizer (+ nanochat special-token map) to {tokenizer_dir}")
+        if isinstance(self.enc, _HFTiktokenAdapter):
+            # normal case: the Qwen1.5-backed nanochat tokenizer
+            self.enc.hf_tokenizer.save_pretrained(tokenizer_dir)
+            meta_path = os.path.join(tokenizer_dir, "nanochat_special_map.json")
+            with open(meta_path, "w") as f:
+                json.dump(self.enc.special_map, f)
+            print(f"Saved Qwen1.5 tokenizer (+ nanochat special-token map) to {tokenizer_dir}")
+        else:
+            # a raw tiktoken.Encoding (e.g. one of from_pretrained's gpt2/cl100k_base
+            # baselines) - pickle it, same as the original implementation did.
+            pickle_path = os.path.join(tokenizer_dir, "tokenizer.pkl")
+            with open(pickle_path, "wb") as f:
+                pickle.dump(self.enc, f)
+            print(f"Saved tokenizer encoding to {pickle_path}")
 
     def render_conversation(self, conversation, max_tokens=2048):
         """
