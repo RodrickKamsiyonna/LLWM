@@ -42,7 +42,7 @@ def evaluate_bpb(model, batches, steps, token_bytes):
         # Use the mean action (no sampling noise) for stable, reproducible eval —
         # same idea as using the mean latent in a VAE at test time.
         h = model.encode(x)
-        y_emb = model.transformer.wte(y.clamp(min=0)).to(h.dtype)
+        y_emb = model.wte(y.clamp(min=0)).to(h.dtype)
         mean, _ = model.action_encoder(h, y_emb)
         logits = model.predictor(h, mean)
         logits = logits[..., :vocab_size].float()
