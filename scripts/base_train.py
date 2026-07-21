@@ -57,7 +57,7 @@ parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding 
 parser.add_argument("--kl-lambda", type=float, default=1.0, help="weight for KL divergence loss (action encoder regularization)")
 parser.add_argument("--eqm-lambda", type=float, default=1.0, help="weight for equilibrium matching loss (passed into GPT model)")
 # Training horizon (only one used, in order of precedence)
-parser.add_argument("--num-iterations", type=int, default=10000, help="explicit number of optimization steps (-1 = disable)")
+parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
 parser.add_argument("--target-param-data-ratio", type=float, default=12, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
 # Optimization
@@ -77,7 +77,7 @@ parser.add_argument("--eval-every", type=int, default=1000, help="evaluate val b
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
 parser.add_argument("--core-metric-every", type=int, default=9500, help="evaluate CORE metric every N steps (-1 = disable)")
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
-parser.add_argument("--sample-every", type=int, default=500, help="sample from model every N steps (-1 = disable)")
+parser.add_argument("--sample-every", type=int, default=100, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
