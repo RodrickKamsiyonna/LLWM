@@ -41,11 +41,11 @@ from nanochat.optim import MuonAdamW
 @dataclass
 class GPTConfig:
     # --- the one real input now: which frozen backbone to wrap ---
-    qwen_model_name: str = "Qwen/Qwen1.5-1.8B"
+    qwen_model_name: str = "Qwen/Qwen1.5-0.5B"
 
     # --- world-model head config (still real inputs) ---
     action_dim: int = None
-    action_encoder_depth_ratio: int = 2  # ActionEncoder gets ceil(n_layer / this); Predictor is fixed at ceil(n_layer/2)
+    action_encoder_depth_ratio: int = 4  # ActionEncoder gets ceil(n_layer / this); Predictor is fixed at ceil(n_layer/2)
     eqm_lambda: float = 1.0
 
     # --- derived from the backbone's HF config in __post_init__, kept here purely so
@@ -182,7 +182,7 @@ class Predictor(nn.Module):
     the model's actual output projection now (Qwen's own lm_head is never used)."""
     def __init__(self, config, pad_vocab_size_to=64):
         super().__init__()
-        self.n_layer = -(-config.n_layer // 2)  # ceil(n_layer / 2)
+        self.n_layer = -(-config.n_layer // 4)  # ceil(n_layer / 2)
         self.blocks = nn.ModuleList([PredictorBlock(config) for _ in range(self.n_layer)])
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         self.head = Linear(config.n_embd, padded_vocab_size, bias=False)
