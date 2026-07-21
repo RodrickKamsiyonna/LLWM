@@ -1,10 +1,39 @@
 """
-BPE Tokenizer in the style of GPT-4: train with rustbpe, inference with tiktoken.
+Tokenizer (rewrite): now a thin nanochat-shaped wrapper around Qwen1.5's own
+HF tokenizer, instead of training our own rustbpe/tiktoken vocab from scratch.
+
+Why: nanochat.gpt.GPT now wraps a frozen Qwen1.5 backbone (see nanochat/gpt.py). Its
+input embedding table is indexed by Qwen1.5's vocabulary, so token ids produced here
+have to be Qwen1.5's token ids, not our old custom 32768-token BPE vocab.
+
+How the public API stays the same: RustBPETokenizer's methods (encode, decode,
+encode_special, render_conversation, visualize_tokenization, render_for_completion,
+get_bos_token_id, get_vocab_size, get_special_tokens, id_to_token,
+decode_single_token_bytes, __call__, save) are UNCHANGED below - they were all written
+against tiktoken.Encoding's interface, and self.enc is now a small adapter
+(_HFTiktokenAdapter) that presents that same interface on top of a real HF tokenizer.
+So the only things that actually changed are: what self.enc IS, and the four
+classmethods that construct it (train_from_iterator / from_directory / from_pretrained,
+plus a new from_qwen).
 """
 
 import os
+import re
+import json
 import copy
 from functools import lru_cache
+
+from transformers import AutoTokenizer, AutoConfig
+from transformers.models.gpt2.tokenization_gpt2 import bytes_to_unicode
+
+# Keep this in sync with nanochat.gpt.GPTConfig.qwen_model_name's default. Imported
+# rather than hardcoded twice where possible, with a literal fallback so this file
+# doesn't hard-fail to import if gpt.py is ever missing/renamed.
+try:
+    from nanochat.gpt import GPTConfig as _GPTConfig
+    QWEN_MODEL_NAME = _GPTConfig.__dataclass_fields__["qwen_model_name"].default
+except Exception:
+    QWEN_MODEL_NAME = "Qwen/Qwen1.5-0.5B"
 
 SPECIAL_TOKENS = [
     # every document begins with the Beginning of Sequence (BOS) token that delimits documents
@@ -20,62 +49,172 @@ SPECIAL_TOKENS = [
     "<|output_end|>",
 ]
 
-# NOTE: this split pattern deviates from GPT-4 in that we use \p{N}{1,2} instead of \p{N}{1,3}
-# I did this because I didn't want to "waste" too many tokens on numbers for smaller vocab sizes.
-# I verified that 2 is the sweet spot for vocab size of 32K. 1 is a bit worse, 3 was worse still.
+# NOTE: no longer used for training (Qwen1.5's own pretrained tokenizer is used as-is),
+# kept only in case anything still imports SPLIT_PATTERN from this module.
 SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
 
 # -----------------------------------------------------------------------------
-# Tokenizer based on rustbpe + tiktoken combo
-import pickle
-import rustbpe
-import tiktoken
+# Byte-level decoding helpers (Qwen1.5, like GPT-2, maps raw bytes to a printable
+# unicode alphabet before BPE merging - this inverts that mapping so
+# decode_single_token_bytes can return exact original bytes, same guarantee tiktoken's
+# version gave us).
+_BYTE_DECODER = {v: k for k, v in bytes_to_unicode().items()}  # unicode char -> byte value
+
+def _token_str_to_bytes(token_str):
+    try:
+        return bytes(_BYTE_DECODER[c] for c in token_str)
+    except KeyError:
+        # Not a pure byte-level-alphabet token (e.g. a special token's literal string) -
+        # fall back to plain utf-8 bytes of the token text.
+        return token_str.encode("utf-8")
+
+
+class _HFTiktokenAdapter:
+    """Presents a tiktoken.Encoding-like interface (encode_ordinary,
+    encode_ordinary_batch, decode, decode_single_token_bytes, encode_single_token,
+    special_tokens_set, n_vocab) on top of a real HF tokenizer (Qwen1.5's), so
+    RustBPETokenizer's own methods below don't need to know or care that the backing
+    tokenizer changed."""
+    def __init__(self, hf_tokenizer, special_map):
+        self.hf_tokenizer = hf_tokenizer
+        self.special_map = dict(special_map)  # nanochat name -> token id, e.g. "<|bos|>" -> 151646
+        self._id_to_name = {v: k for k, v in self.special_map.items()}
+
+    @property
+    def n_vocab(self):
+        return len(self.hf_tokenizer)
+
+    @property
+    def special_tokens_set(self):
+        return set(self.special_map.keys())
+
+    def encode_single_token(self, text):
+        if text in self.special_map:
+            return self.special_map[text]
+        ids = self.hf_tokenizer.encode(text, add_special_tokens=False)
+        assert len(ids) == 1, f"'{text}' is not a single token in the Qwen1.5 tokenizer"
+        return ids[0]
+
+    def encode_ordinary(self, text):
+        return self.hf_tokenizer.encode(text, add_special_tokens=False)
+
+    def encode_ordinary_batch(self, texts, num_threads=8):
+        # HF's fast tokenizers are already internally multi-threaded (Rust); num_threads
+        # is accepted only for call-site compatibility with the old tiktoken signature.
+        enc = self.hf_tokenizer(texts, add_special_tokens=False)
+        return enc["input_ids"]
+
+    def decode(self, ids):
+        return self.hf_tokenizer.decode(ids, skip_special_tokens=False)
+
+    def decode_single_token_bytes(self, token_id):
+        if token_id in self._id_to_name:
+            return self._id_to_name[token_id].encode("utf-8")
+        token_str = self.hf_tokenizer.convert_ids_to_tokens([token_id])[0]
+        return _token_str_to_bytes(token_str)
+
+
+# -----------------------------------------------------------------------------
+# Tokenizer based on Qwen1.5's HF tokenizer
 
 class RustBPETokenizer:
-    """Light wrapper around tiktoken (for efficient inference) but train with rustbpe"""
+    """Light nanochat-shaped wrapper, now backed by Qwen1.5's own HF tokenizer.
+    Class name kept as-is so `from nanochat.tokenizer import RustBPETokenizer`
+    elsewhere in the codebase doesn't need to change."""
 
     def __init__(self, enc, bos_token):
         self.enc = enc
         self.bos_token_id = self.encode_special(bos_token)
 
     @classmethod
-    def train_from_iterator(cls, text_iterator, vocab_size):
-        # 1) train using rustbpe
-        tokenizer = rustbpe.Tokenizer()
-        # the special tokens are inserted later in __init__, we don't train them here
-        vocab_size_no_special = vocab_size - len(SPECIAL_TOKENS)
-        assert vocab_size_no_special >= 256, f"vocab_size_no_special must be at least 256, got {vocab_size_no_special}"
-        tokenizer.train_from_iterator(text_iterator, vocab_size_no_special, pattern=SPLIT_PATTERN)
-        # 2) construct the associated tiktoken encoding for inference
-        pattern = tokenizer.get_pattern()
-        mergeable_ranks_list = tokenizer.get_mergeable_ranks()
-        mergeable_ranks = {bytes(k): v for k, v in mergeable_ranks_list}
-        tokens_offset = len(mergeable_ranks)
-        special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-        enc = tiktoken.Encoding(
-            name="rustbpe",
-            pat_str=pattern,
-            mergeable_ranks=mergeable_ranks, # dict[bytes, int] (token bytes -> merge priority rank)
-            special_tokens=special_tokens, # dict[str, int] (special token name -> token id)
-        )
+    def from_qwen(cls, qwen_model_name=None):
+        """Load Qwen1.5's own tokenizer and splice in nanochat's own special tokens
+        (BOS + chat/tool delimiters). We try hard to avoid growing the vocabulary: HF's
+        add_special_tokens() appends new ids starting at len(tokenizer), and Qwen1.5's
+        embedding table is usually padded a bit larger than the tokenizer's raw
+        vocabulary (for tensor-core-friendly shapes), so the new ids frequently land in
+        already-unused-but-allocated embedding rows for free. If they don't fit, this
+        prints an explicit warning telling you to resize the (frozen) backbone's
+        embedding table in nanochat/gpt.py."""
+        qwen_model_name = qwen_model_name or QWEN_MODEL_NAME
+        hf_tokenizer = AutoTokenizer.from_pretrained(qwen_model_name)
+        vocab_size_before = len(hf_tokenizer)
+
+        num_added = hf_tokenizer.add_special_tokens({"additional_special_tokens": list(SPECIAL_TOKENS)})
+        special_map = {name: hf_tokenizer.convert_tokens_to_ids(name) for name in SPECIAL_TOKENS}
+
+        if num_added:
+            try:
+                embedding_rows = AutoConfig.from_pretrained(qwen_model_name).vocab_size
+            except Exception:
+                embedding_rows = vocab_size_before
+            if len(hf_tokenizer) > embedding_rows:
+                print(
+                    f"WARNING: added {num_added} new special tokens to the Qwen1.5 tokenizer, "
+                    f"pushing its size to {len(hf_tokenizer)}, PAST the backbone's embedding "
+                    f"table size ({embedding_rows}). Before training/inference you need to call "
+                    f"`backbone.resize_token_embeddings(len(hf_tokenizer))` inside "
+                    f"GPT.init_weights() in nanochat/gpt.py, or these new token ids will index "
+                    f"out of range in the frozen embedding table."
+                )
+            else:
+                print(
+                    f"Added {num_added} nanochat special tokens into unused padding rows already "
+                    f"present in the Qwen1.5 embedding table ({vocab_size_before} -> {len(hf_tokenizer)} "
+                    f"of {embedding_rows} available) - no backbone resize needed."
+                )
+
+        enc = _HFTiktokenAdapter(hf_tokenizer, special_map)
         return cls(enc, "<|bos|>")
+
+    @classmethod
+    def train_from_iterator(cls, text_iterator, vocab_size):
+        """No longer trains a custom BPE vocab - nanochat now standardizes on Qwen1.5's
+        own tokenizer (to match the frozen Qwen1.5 backbone in gpt.py). Kept with the
+        same signature purely so tok_train.py (and anything else that calls this) still
+        runs unmodified; `text_iterator` and `vocab_size` are accepted but ignored."""
+        print(
+            "NOTE: train_from_iterator no longer trains a tokenizer - nanochat now uses "
+            "Qwen1.5's own pretrained tokenizer (see nanochat/gpt.py). Loading it instead "
+            "of training; `text_iterator` and `vocab_size` are ignored."
+        )
+        return cls.from_qwen()
 
     @classmethod
     def from_directory(cls, tokenizer_dir):
-        pickle_path = os.path.join(tokenizer_dir, "tokenizer.pkl")
-        with open(pickle_path, "rb") as f:
-            enc = pickle.load(f)
+        hf_tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
+        meta_path = os.path.join(tokenizer_dir, "nanochat_special_map.json")
+        if os.path.exists(meta_path):
+            with open(meta_path) as f:
+                special_map = json.load(f)
+        else:
+            # Directory wasn't saved by RustBPETokenizer.save() (e.g. a raw HF tokenizer
+            # dir) - nanochat's special tokens may or may not already be present.
+            special_map = {}
+            for name in SPECIAL_TOKENS:
+                tid = hf_tokenizer.convert_tokens_to_ids(name)
+                if tid is not None and tid != hf_tokenizer.unk_token_id:
+                    special_map[name] = tid
+            missing = [name for name in SPECIAL_TOKENS if name not in special_map]
+            if missing:
+                raise ValueError(
+                    f"{tokenizer_dir} has no nanochat_special_map.json and is missing "
+                    f"nanochat special tokens {missing}. Load it via "
+                    f"RustBPETokenizer.from_qwen() and .save() it once first."
+                )
+        enc = _HFTiktokenAdapter(hf_tokenizer, special_map)
         return cls(enc, "<|bos|>")
 
     @classmethod
-    def from_pretrained(cls, tiktoken_name):
-        # https://github.com/openai/tiktoken/blob/eedc8563/tiktoken_ext/openai_public.py
-        enc = tiktoken.get_encoding(tiktoken_name)
-        # tiktoken calls the special document delimiter token "<|endoftext|>"
-        # yes this is confusing because this token is almost always PREPENDED to the beginning of the document
-        # it most often is used to signal the start of a new sequence to the LLM during inference etc.
-        # so in nanoChat we always use "<|bos|>" short for "beginning of sequence", but historically it is often called "<|endoftext|>".
-        return cls(enc, "<|endoftext|>")
+    def from_pretrained(cls, hf_model_name=None):
+        """Previously loaded a *tiktoken* public encoding by name (e.g. 'cl100k_base').
+        Now loads an HF tokenizer by model name instead (defaults to the same Qwen1.5
+        checkpoint nanochat.gpt.GPTConfig uses) - functionally identical to
+        from_qwen(). NOTE: if some other script calls this with an old tiktoken
+        encoding name expecting the old GPT-4-style public vocab specifically, that
+        will now fail (there's no HF model by that name) - update that call site to
+        pass a real HF/Qwen model name, or just call from_qwen()."""
+        return cls.from_qwen(hf_model_name)
 
     def get_vocab_size(self):
         return self.enc.n_vocab
@@ -130,12 +269,13 @@ class RustBPETokenizer:
         return self.enc.decode_single_token_bytes(token_id)
 
     def save(self, tokenizer_dir):
-        # save the encoding object to disk
+        # save the HF tokenizer + nanochat's special-token id map to disk
         os.makedirs(tokenizer_dir, exist_ok=True)
-        pickle_path = os.path.join(tokenizer_dir, "tokenizer.pkl")
-        with open(pickle_path, "wb") as f:
-            pickle.dump(self.enc, f)
-        print(f"Saved tokenizer encoding to {pickle_path}")
+        self.enc.hf_tokenizer.save_pretrained(tokenizer_dir)
+        meta_path = os.path.join(tokenizer_dir, "nanochat_special_map.json")
+        with open(meta_path, "w") as f:
+            json.dump(self.enc.special_map, f)
+        print(f"Saved Qwen1.5 tokenizer (+ nanochat special-token map) to {tokenizer_dir}")
 
     def render_conversation(self, conversation, max_tokens=2048):
         """
