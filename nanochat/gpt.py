@@ -258,11 +258,21 @@ class GPT(nn.Module):
             return next(self.backbone.parameters()).device
         return self.action_encoder.mean_head.weight.device
 
+    @property
+    def wte(self):
+        """Back-compat alias: several nanochat scripts (loss_eval.py's evaluate_bpb, in
+        particular) call `model.wte(ids)` directly to get token embeddings, from back
+        when the trunk had its own dedicated embedding table. That table is now inside
+        the frozen Qwen backbone, so this just forwards to it - `model.wte(ids)` still
+        works exactly as before without those call sites needing to change."""
+        assert self.backbone is not None, "call init_weights() first to load the Qwen backbone"
+        return self.backbone.get_input_embeddings()
+
     def _embed(self, idx):
         """Token ids -> Qwen's own input embeddings (used for building inputs_embeds
-        outside of a plain forward pass, e.g. in plan_and_generate)."""
-        assert self.backbone is not None, "call init_weights() first"
-        return self.backbone.get_input_embeddings()(idx)
+        outside of a plain forward pass, e.g. in plan_and_generate). Equivalent to
+        self.wte(idx) - kept as a separate method for internal readability.""" 
+        return self.wte(idx)
 
     # ---- FLOPs / param accounting -------------------------------------------------
 
