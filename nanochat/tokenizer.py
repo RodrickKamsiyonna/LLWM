@@ -105,7 +105,11 @@ class _HFTiktokenAdapter:
         return enc["input_ids"]
 
     def decode(self, ids):
-        return self.hf_tokenizer.decode(ids, skip_special_tokens=False)
+        # clean_up_tokenization_spaces=False is essential here: HF's default behavior
+        # (True, for legacy reasons) rewrites things like " ." -> "." and " n't" -> "n't"
+        # on decode, which silently breaks the exact encode/decode roundtrip tiktoken
+        # always guaranteed (and that tok_eval.py's `assert decoded == text` relies on).
+        return self.hf_tokenizer.decode(ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
 
     def decode_single_token_bytes(self, token_id):
         if token_id in self._id_to_name:
