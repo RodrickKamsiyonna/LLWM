@@ -35,7 +35,7 @@ try:
     from nanochat.gpt import GPTConfig as _GPTConfig
     QWEN_MODEL_NAME = _GPTConfig.__dataclass_fields__["qwen_model_name"].default
 except Exception:
-    QWEN_MODEL_NAME = "Qwen/Qwen1.5-0.5B"
+    QWEN_MODEL_NAME = "Qwen/Qwen1.5-1.8B"
 
 SPECIAL_TOKENS = [
     # every document begins with the Beginning of Sequence (BOS) token that delimits documents
