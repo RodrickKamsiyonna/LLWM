@@ -51,7 +51,7 @@ parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["ro
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
-parser.add_argument("--max-seq-len", type=int, default=512, help="max context length")
+parser.add_argument("--max-seq-len", type=int, default=128, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=short (e.g. 'SSSL')")
 # Loss weighting
 parser.add_argument("--kl-lambda", type=float, default=1.0, help="weight for KL divergence loss (action encoder regularization)")
