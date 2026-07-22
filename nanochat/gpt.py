@@ -1,4 +1,4 @@
-"""
+u"""
 GPT model (rewrite #2): frozen Qwen1.5 backbone + our own world-model heads
 Notable features:
 - The trunk (token embedding + attention/MLP stack that used to be hand-rolled here,
@@ -45,7 +45,7 @@ class GPTConfig:
 
     # --- world-model head config (still real inputs) ---
     action_dim: int = None
-    action_encoder_depth_ratio: int = 4  # ActionEncoder gets ceil(n_layer / this); Predictor is fixed at ceil(n_layer/2)
+    action_encoder_depth_ratio: int = 12  # ActionEncoder gets ceil(n_layer / this); Predictor is fixed at ceil(n_layer/2)
     eqm_lambda: float = 1.0
 
     # --- derived from the backbone's HF config in __post_init__, kept here purely so
@@ -57,7 +57,7 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 6
     n_kv_head: int = 6
-    n_embd: int = 2048
+    n_embd: int = 1024
     window_pattern: str = "SSSL"  # no longer used (Qwen1.5 base does plain full causal attention); kept only so old call sites that pass it don't break
 
     def __post_init__(self):
@@ -182,7 +182,7 @@ class Predictor(nn.Module):
     the model's actual output projection now (Qwen's own lm_head is never used)."""
     def __init__(self, config, pad_vocab_size_to=64):
         super().__init__()
-        self.n_layer = -(-config.n_layer // 4)  # ceil(n_layer / 2)
+        self.n_layer = -(-config.n_layer // 12)  # ceil(n_layer / 2)
         self.blocks = nn.ModuleList([PredictorBlock(config) for _ in range(self.n_layer)])
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         self.head = Linear(config.n_embd, padded_vocab_size, bias=False)
