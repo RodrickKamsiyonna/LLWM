@@ -1,4 +1,4 @@
-u"""
+"""
 GPT model (rewrite #2): frozen Qwen1.5 backbone + our own world-model heads
 Notable features:
 - The trunk (token embedding + attention/MLP stack that used to be hand-rolled here,
@@ -45,7 +45,7 @@ class GPTConfig:
 
     # --- world-model head config (still real inputs) ---
     action_dim: int = None
-    action_encoder_depth_ratio: int = 12  # ActionEncoder gets ceil(n_layer / this); Predictor is fixed at ceil(n_layer/2)
+    action_encoder_depth_ratio: int = 12 # ActionEncoder gets ceil(n_layer / this); Predictor is fixed at ceil(n_layer/2)
     eqm_lambda: float = 1.0
 
     # --- derived from the backbone's HF config in __post_init__, kept here purely so
@@ -57,7 +57,7 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 6
     n_kv_head: int = 6
-    n_embd: int = 1024
+    n_embd: int = 768
     window_pattern: str = "SSSL"  # no longer used (Qwen1.5 base does plain full causal attention); kept only so old call sites that pass it don't break
 
     def __post_init__(self):
@@ -440,10 +440,20 @@ class GPT(nn.Module):
 
     # ---- forward / encode -----------------------------------------------------------
 
+    @torch._dynamo.disable
     def encode(self, idx, kv_cache=None):
         """Runs token ids through the frozen Qwen1.5 backbone and returns h (post-norm),
         exactly like the old hand-rolled trunk's encode() did - just with Qwen managing
-        its own attention/rotary/KV-cache internally instead of our flash-attn code."""
+        its own attention/rotary/KV-cache internally instead of our flash-attn code.
+
+        @torch._dynamo.disable: base_train.py wraps the whole GPT model in
+        torch.compile(). The old trunk was written in plain, compile-friendly torch ops
+        specifically for that; HF's Qwen2Model implementation is not, and tracing/
+        compiling through it directly is known to be extremely slow (and buys nothing,
+        since the backbone is frozen - there's no gradient-fusion benefit to compiling
+        through it). This tells dynamo to treat the backbone call as an opaque boundary
+        (one graph break here) and only compile the parts we actually wrote below
+        (ActionEncoder/Predictor/loss math), which are the parts that benefit from it."""
         assert self.backbone is not None, "call init_weights() first to load the Qwen backbone"
         B, T = idx.size()
         assert T <= self.config.sequence_len, f"sequence length {T} exceeds backbone's max_position_embeddings-derived sequence_len {self.config.sequence_len}"
@@ -454,9 +464,11 @@ class GPT(nn.Module):
         h = out.last_hidden_state.to(COMPUTE_DTYPE)
         return norm(h)
 
+    @torch._dynamo.disable
     def encode_embeddings(self, emb, kv_cache=None):
         """Same as encode(), but input is already-embedded (used during planning, where
-        'thinking' tokens are soft/probability-weighted rather than hard ids)."""
+        'thinking' tokens are soft/probability-weighted rather than hard ids). See
+        encode()'s docstring for why this is also excluded from torch.compile tracing."""
         assert self.backbone is not None, "call init_weights() first to load the Qwen backbone"
         emb = emb.to(COMPUTE_DTYPE)
         if kv_cache is None:
