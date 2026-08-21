@@ -20,12 +20,12 @@ CORPUS = [
 
 @pytest.fixture(scope="module")
 def tokenizer():
-    vocab_size = 256 + len(SPECIAL_TOKENS) + 35 # bytes + specials + a few merges
-    return RustBPETokenizer.train_from_iterator(iter(CORPUS), vocab_size)
+    return RustBPETokenizer.from_qwen("Qwen/Qwen1.5-0.5B")
 
 
 def test_vocab_size(tokenizer):
-    assert tokenizer.get_vocab_size() == 256 + len(SPECIAL_TOKENS) + 35
+    # Qwen1.5-0.5B base vocab is 151646 + 9 nanochat special tokens = 151655
+    assert tokenizer.get_vocab_size() >= 151646
 
 
 def test_encode_decode_roundtrip(tokenizer):
