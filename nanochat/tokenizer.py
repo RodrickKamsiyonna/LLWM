@@ -98,12 +98,15 @@ class _HFTiktokenAdapter:
         return ids[0]
 
     def encode_ordinary(self, text):
-        return self.hf_tokenizer.encode(text, add_special_tokens=False)
+        # Tiktoken's encode_ordinary treats all special tokens as ordinary text.
+        # split_special_tokens=True ensures HF's tokenizer does not collapse literal special token strings (like '<|bos|>')
+        # into single special token IDs during ordinary encoding.
+        return self.hf_tokenizer.encode(text, add_special_tokens=False, split_special_tokens=True)
 
     def encode_ordinary_batch(self, texts, num_threads=8):
         # HF's fast tokenizers are already internally multi-threaded (Rust); num_threads
         # is accepted only for call-site compatibility with the old tiktoken signature.
-        enc = self.hf_tokenizer(texts, add_special_tokens=False)
+        enc = self.hf_tokenizer(texts, add_special_tokens=False, split_special_tokens=True)
         return enc["input_ids"]
 
     def decode(self, ids):

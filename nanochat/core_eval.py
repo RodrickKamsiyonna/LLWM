@@ -153,7 +153,7 @@ def forward_model(model, input_ids):
     # collapsing to a scalar ce_loss. Uses the action *mean* (no sampling noise)
     # so eval is deterministic, since we don't need the KL/EQM training signal here.
     h = model.encode(input_ids)
-    y_emb = model.transformer.wte(target_ids.clamp(min=0)).to(h.dtype)
+    y_emb = model.wte(target_ids.clamp(min=0)).to(h.dtype)
     mean, _ = model.action_encoder(h, y_emb)
     logits = model.predictor(h, mean)
     logits = logits[..., :model.config.vocab_size].float()

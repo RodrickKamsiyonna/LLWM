@@ -17,7 +17,6 @@ import torch
 import pytest
 import nanochat.flash_attention as fa_module
 from nanochat.flash_attention import flash_attn, HAS_FA3
-from nanochat.engine import KVCache
 
 
 def set_impl(impl):
@@ -290,16 +289,13 @@ class TestSDPAOnly:
         set_impl(None)
 
     def test_kvcache(self):
-        """Test SDPA with KV cache."""
+        """Test SDPA with KV cache tensor buffers."""
         set_impl('sdpa')
         B, T_max, H, D = 2, 64, 4, 32
-        n_layers = 1
 
-        cache = KVCache(
-            batch_size=B, num_heads=H, seq_len=T_max, head_dim=D,
-            num_layers=n_layers, device=self.DEVICE, dtype=self.DTYPE
-        )
-        k_cache, v_cache = cache.get_layer_cache(0)
+        k_cache = torch.zeros(B, T_max, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        v_cache = torch.zeros(B, T_max, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        cache_seqlens = torch.zeros(B, dtype=torch.int32, device=self.DEVICE)
 
         # Prefill
         T_prefill = 16
@@ -309,13 +305,13 @@ class TestSDPAOnly:
 
         y = flash_attn.flash_attn_with_kvcache(
             q, k_cache, v_cache, k=k, v=v,
-            cache_seqlens=cache.cache_seqlens,
+            cache_seqlens=cache_seqlens,
             causal=True, window_size=(T_max, 0)
         )
-        cache.advance(T_prefill)
+        cache_seqlens += T_prefill
 
         assert y.shape == (B, T_prefill, H, D)
-        assert cache.get_pos() == T_prefill
+        assert (cache_seqlens == T_prefill).all()
 
         # Generate single token
         q_single = torch.randn(B, 1, H, D, device=self.DEVICE, dtype=self.DTYPE)
@@ -324,13 +320,13 @@ class TestSDPAOnly:
 
         y_single = flash_attn.flash_attn_with_kvcache(
             q_single, k_cache, v_cache, k=k_single, v=v_single,
-            cache_seqlens=cache.cache_seqlens,
+            cache_seqlens=cache_seqlens,
             causal=True, window_size=(T_max, 0)
         )
-        cache.advance(1)
+        cache_seqlens += 1
 
         assert y_single.shape == (B, 1, H, D)
-        assert cache.get_pos() == T_prefill + 1
+        assert (cache_seqlens == T_prefill + 1).all()
         set_impl(None)
 
 
