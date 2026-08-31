@@ -344,43 +344,69 @@ class GPT(nn.Module):
         """Bytes of KV cache *read* by one decode step at a given context length. No
         sliding window in the Qwen1.5 base backbone, so this is just every cached token."""
         return self.kv_bytes_per_token() * min(context_len, self.config.sequence_len)
-
+    
     def num_scaling_params(self):
         """
-        Return detailed parameter counts for scaling law analysis.
-
-        IMPORTANT: this keeps the OLD key names ('wte', 'value_embeds',
-        'transformer_matrices', 'lm_head', 'action_encoder', 'predictor', 'scalars',
-        'total') alive too, purely so call sites like base_train.py's
-        `params_counts['transformer_matrices'] + params_counts['lm_head']` don't
-        KeyError. 'transformer_matrices' is mapped to the frozen backbone's param count
-        (closest old-key analogue - it used to be "the trunk's big matrix stack", which
-        is now Qwen1.5 instead of our own attention/MLP blocks). 'wte', 'value_embeds',
-        and 'scalars' are 0 - there's no separate trainable embedding table or per-layer
-        scalar params anymore, they're gone along with the old trunk.
-
-        CAVEAT for anything doing Chinchilla-style compute-optimal scaling-law math with
-        these numbers: 'transformer_matrices' (the backbone) is FROZEN - it costs forward
-        FLOPs but receives no gradient and isn't "trained" in the way the old trunk was.
-        If your scaling-law code assumes `transformer_matrices + lm_head` params are all
-        being trained, that assumption no longer holds; you likely want 'trainable_total'
-        (action_encoder + predictor + lm_head only) for that kind of analysis instead.
+        Return parameter counts for scaling-law/data-size calculations.
+    
+        IMPORTANT:
+        The Qwen1.5 backbone is frozen and must NOT contribute to the
+        parameter count used for scaling-law target data size.
+    
+        Only the trainable ActionEncoder + Predictor parameters are counted
+        for scaling purposes.
+    
+        Legacy keys are retained so existing training code does not break.
         """
+    
         backbone = self.num_backbone_params()
-        lm_head = sum(p.numel() for p in self.predictor.head.parameters())
-        action_encoder = sum(p.numel() for p in self.action_encoder.parameters())
-        predictor = sum(p.numel() for block in self.predictor.blocks for p in block.parameters())
+    
+        lm_head = sum(
+            p.numel()
+            for p in self.predictor.head.parameters()
+        )
+    
+        action_encoder = sum(
+            p.numel()
+            for p in self.action_encoder.parameters()
+        )
+    
+        predictor = sum(
+            p.numel()
+            for block in self.predictor.blocks
+            for p in block.parameters()
+        )
+    
         trainable_total = lm_head + action_encoder + predictor
         total = backbone + trainable_total
+    
         if self.backbone is not None:
-            assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
+            assert total == sum(p.numel() for p in self.parameters()), \
+                "Parameter count mismatch"
+    
         return {
-            # new, clearer names
-            'backbone_frozen': backbone, 'trainable_total': trainable_total,
-            # old names, kept alive for backward compatibility (see docstring caveat above)
-            'wte': 0, 'value_embeds': 0, 'scalars': 0,
-            'transformer_matrices': backbone,
-            'lm_head': lm_head, 'action_encoder': action_encoder, 'predictor': predictor,
+            # New names
+            'backbone_frozen': backbone,
+            'trainable_total': trainable_total,
+    
+            # Legacy names
+            'wte': 0,
+            'value_embeds': 0,
+            'scalars': 0,
+    
+            # IMPORTANT:
+            # The old training code may use:
+            # params_counts['transformer_matrices'] + params_counts['lm_head']
+            #
+            # Since the Qwen backbone is frozen, transformer_matrices must
+            # represent ONLY trainable matrix parameters for scaling purposes.
+            'transformer_matrices': action_encoder + predictor,
+    
+            'lm_head': lm_head,
+            'action_encoder': action_encoder,
+            'predictor': predictor,
+    
+            # Keep this as the true physical parameter count for reporting.
             'total': total,
         }
 
