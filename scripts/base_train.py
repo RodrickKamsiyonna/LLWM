@@ -54,8 +54,8 @@ parser.add_argument("--head-dim", type=int, default=128, help="target head dimen
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=short (e.g. 'SSSL')")
 # Loss weighting
-parser.add_argument("--kl-lambda", type=float, default=1.0, help="weight for KL divergence loss (action encoder regularization)")
-parser.add_argument("--eqm-lambda", type=float, default=1.0, help="weight for equilibrium matching loss (passed into GPT model)")
+parser.add_argument("--kl-lambda", type=float, default=0.1, help="weight for KL divergence loss (action encoder regularization)")
+parser.add_argument("--eqm-lambda", type=float, default=0.1, help="weight for equilibrium matching loss (passed into GPT model)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
